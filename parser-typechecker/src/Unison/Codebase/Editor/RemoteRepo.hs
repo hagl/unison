@@ -9,11 +9,11 @@ import Unison.Codebase.Path (Path)
 import Unison.Codebase.ShortBranchHash (ShortBranchHash)
 import qualified Unison.Codebase.ShortBranchHash as SBH
 
-data ReadRepo = ReadGitRepo { url :: Text {-, commitish :: Maybe Text -}} deriving (Eq, Ord, Show)
-data WriteRepo = WriteGitRepo { url' :: Text {-, branch :: Maybe Text -}} deriving (Eq, Ord, Show)
+data ReadRepo = ReadGitRepo { url :: Text, commitish :: Maybe Text } deriving (Eq, Ord, Show)
+data WriteRepo = WriteGitRepo { url' :: Text, branch :: Maybe Text } deriving (Eq, Ord, Show)
 
 writeToRead :: WriteRepo -> ReadRepo
-writeToRead (WriteGitRepo url) = ReadGitRepo url
+writeToRead (WriteGitRepo {url', branch}) = ReadGitRepo {url=url', commitish=branch}
 
 writePathToRead :: WriteRemotePath -> ReadRemoteNamespace
 writePathToRead (w, p) = (writeToRead w, Nothing, p)

@@ -55,7 +55,7 @@ import Unison.Codebase.Branch (Branch (..))
 import qualified Unison.Codebase.Branch as Branch
 import qualified Unison.Codebase.Causal as Causal
 import Unison.Codebase.Editor.Git (gitIn, gitTextIn, pullRepo, withIsolatedRepo)
-import Unison.Codebase.Editor.RemoteRepo (ReadRemoteNamespace, WriteRepo (WriteGitRepo), printWriteRepo, writeToRead)
+import Unison.Codebase.Editor.RemoteRepo (ReadRemoteNamespace, WriteRepo (..), printWriteRepo, writeToRead)
 import qualified Unison.Codebase.GitError as GitError
 import qualified Unison.Codebase.Init as Codebase
 import qualified Unison.Codebase.Init.CreateCodebaseError as Codebase1
@@ -1179,7 +1179,7 @@ pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = Unlift
 
     -- Commit our changes
     push :: forall m. MonadIO m => CodebasePath -> WriteRepo -> m Bool -- withIOError needs IO
-    push remotePath (WriteGitRepo url) = time "SqliteCodebase.pushGitRootBranch.push" $ do
+    push remotePath (WriteGitRepo {url'=url, branch=gitBranch}) = time "SqliteCodebase.pushGitRootBranch.push" $ do
       -- has anything changed?
       -- note: -uall recursively shows status for all files in untracked directories
       --   we want this so that we see

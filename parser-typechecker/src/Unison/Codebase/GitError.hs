@@ -19,6 +19,8 @@ data GitProtocolError
   | -- url commit Diff of what would change on merge with remote
     PushDestinationHasNewStuff WriteRepo
   | CleanupError SomeException
+  | -- Thrown when a commit, tag, or branch isn't found in a repo.
+    RemoteRefNotFound Text
   deriving (Show)
 
 data GitCodebaseError h

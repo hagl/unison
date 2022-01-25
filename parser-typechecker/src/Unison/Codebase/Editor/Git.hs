@@ -22,7 +22,7 @@ import Control.Monad.Except (MonadError, throwError)
 import qualified Data.Text as Text
 import Shellmet (($?), ($^), ($|))
 import System.FilePath ((</>))
-import Unison.Codebase.Editor.RemoteRepo (ReadRepo (ReadGitRepo))
+import Unison.Codebase.Editor.RemoteRepo (ReadRepo (..))
 import qualified Unison.Codebase.GitError as GitError
 import Unison.CodebasePath (CodebasePath)
 import qualified Unison.Util.Exception as Ex
@@ -85,28 +85,54 @@ withIsolatedRepo srcPath action = do
     copyCommand dest = UnliftIO.tryIO . liftIO $
       "git" $^ (["clone", "--quiet"] ++ ["file://" <> Text.pack srcPath, Text.pack dest])
 
+data GitBranchBehavior =
+      CreateIfMissing
+    | RequireExisting
+
 -- | Given a remote git repo url, and branch/commit hash (currently
 -- not allowed): checks for git, clones or updates a cached copy of the repo
-pullRepo :: (MonadIO m, MonadError GitProtocolError m) => ReadRepo -> m CodebasePath
-pullRepo repo@(ReadGitRepo uri) = do
+pullRepo :: forall m. (MonadIO m, MonadError GitProtocolError m) => ReadRepo -> GitBranchBehavior -> m CodebasePath
+pullRepo repo@(ReadGitRepo {url=uri, commitish}) branchBehavior = do
   checkForGit
   localPath <- gitCacheDir uri
+
+  (pullBranch, createBranch) <- do
+    case commitish of
+      Nothing -> pure (Nothing, Nothing)
+      Just ref -> do
+        exists <- liftIO $ doesRemoteBranchExist ref
+        case branchBehavior of
+          CreateIfMissing
+            | exists -> pure (Just ref, Nothing)
+            | otherwise -> pure (Nothing, Just ref)
+          RequireExisting
+            | exists -> pure (Just ref, Nothing)
+            | otherwise -> throwError (GitError.RemoteRefNotFound ref)
+
   ifM (doesDirectoryExist localPath)
     -- try to update existing directory
     (ifM (isGitRepo localPath)
-      (checkoutExisting localPath Nothing)
+      (checkoutExisting localPath pullBranch)
       (throwError (GitError.UnrecognizableCacheDir repo localPath)))
     -- directory doesn't exist, so clone anew
-    (checkOutNew localPath Nothing)
+    (checkOutNew localPath pullBranch)
+  case createBranch of
+    Nothing -> pure ()
+    Just b -> liftIO ("git" $^ ["checkout", "--branch", b, "--track"])
   pure localPath
   where
+  doesRemoteBranchExist :: Text -> IO Bool
+  doesRemoteBranchExist branchName = do
+    output <- "git" $| ["ls-remote", "--heads", uri, branchName]
+    pure . not . Text.null . Text.strip $ output
+
   -- | Do a `git clone` (for a not-previously-cached repo).
-  checkOutNew :: (MonadIO m, MonadError GitProtocolError m) => CodebasePath -> Maybe Text -> m ()
-  checkOutNew localPath branch = do
+  checkOutNew :: CodebasePath -> Maybe Text -> m ()
+  checkOutNew localPath commitish = do
     withStatus ("Downloading from " ++ Text.unpack uri ++ " ...") $
       (liftIO $
         "git" $^ (["clone", "--quiet"] ++ ["--depth", "1"]
-         ++ maybe [] (\t -> ["--branch", t]) branch
+         ++ maybe [] (\t -> ["--branch", t]) commitish
          ++ [uri, Text.pack localPath]))
         `withIOError` (throwError . GitError.CloneException repo . show)
     isGitDir <- liftIO $ isGitRepo localPath
