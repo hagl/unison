@@ -12,6 +12,8 @@ module Unison.Codebase.Editor.Git
 
     -- * Exported for testing
     gitCacheDir,
+
+    GitBranchBehavior(..)
   )
 where
 
@@ -33,6 +35,10 @@ import qualified Data.Char as Char
 import Unison.Codebase.GitError (GitProtocolError)
 import UnliftIO (handleIO, MonadUnliftIO)
 import qualified UnliftIO
+
+-- Name of the main branch used in codebase repositories
+mainBranchRef :: Text
+mainBranchRef = "main"
 
 
 -- https://superuser.com/questions/358855/what-characters-are-safe-in-cross-platform-file-names-for-linux-windows-and-os
@@ -86,8 +92,8 @@ withIsolatedRepo srcPath action = do
       "git" $^ (["clone", "--quiet"] ++ ["file://" <> Text.pack srcPath, Text.pack dest])
 
 data GitBranchBehavior =
-      CreateIfMissing
-    | RequireExisting
+      CreateBranchIfMissing
+    | RequireExistingBranch
 
 -- | Given a remote git repo url, and branch/commit hash (currently
 -- not allowed): checks for git, clones or updates a cached copy of the repo
@@ -102,10 +108,10 @@ pullRepo repo@(ReadGitRepo {url=uri, commitish}) branchBehavior = do
       Just ref -> do
         exists <- liftIO $ doesRemoteBranchExist ref
         case branchBehavior of
-          CreateIfMissing
+          CreateBranchIfMissing
             | exists -> pure (Just ref, Nothing)
             | otherwise -> pure (Nothing, Just ref)
-          RequireExisting
+          RequireExistingBranch
             | exists -> pure (Just ref, Nothing)
             | otherwise -> throwError (GitError.RemoteRefNotFound ref)
 
@@ -148,7 +154,7 @@ pullRepo repo@(ReadGitRepo {url=uri, commitish}) branchBehavior = do
       -- I don't know how to properly update from an empty remote repo.
       -- As a heuristic, if this cached copy is empty, then the remote might
       -- be too, so this impl. just wipes the cached copy and starts from scratch.
-      goFromScratch
+      (goFromScratch maybeRemoteRef)
       -- Otherwise proceed!
       do
         succeeded <- liftIO . handleIO (const $ pure False) $ do
@@ -156,7 +162,12 @@ pullRepo repo@(ReadGitRepo {url=uri, commitish}) branchBehavior = do
                           -- Fetch only the latest commit, we don't need history.
                           gitIn localPath (["fetch", "origin", remoteRef, "--quiet"] ++ ["--depth", "1"])
                           fetchHeadHash <- gitTextIn localPath ["rev-parse", "FETCH_HEAD"]
+                          gitIn localPath ["checkout", remoteRef]
+                          -- If the local checkout fails it means we don't have a local branch for this ref yet,
+                          -- create a new branch from main to use.
+                            $? gitIn localPath ["checkout", "--branch", remoteRef, mainBranchRef]
                           headHash <- gitTextIn localPath ["rev-parse", "HEAD"]
+
                           -- Only do a hard reset if the remote has actually changed.
                           -- This allows us to persist any codebase migrations in the dirty work tree,
                           -- and avoid re-migrating a codebase we've migrated before.
@@ -168,15 +179,15 @@ pullRepo repo@(ReadGitRepo {url=uri, commitish}) branchBehavior = do
                             -- have in progress, which we may want to handle more nicely in the future.
                             gitIn localPath ["clean", "-d", "--force", "--quiet"]
                           pure True
-        when (not succeeded) $ goFromScratch
+        when (not succeeded) $ goFromScratch maybeRemoteRef
 
     where
       remoteRef :: Text
-      remoteRef = fromMaybe "HEAD" maybeRemoteRef
-      goFromScratch :: (MonadIO m, MonadError GitProtocolError m) => m  ()
-      goFromScratch = do
+      remoteRef = fromMaybe mainBranchRef maybeRemoteRef
+      goFromScratch :: (MonadIO m, MonadError GitProtocolError m) => Maybe Text -> m  ()
+      goFromScratch ref = do
         wipeDir localPath
-        checkOutNew localPath Nothing
+        checkOutNew localPath ref
 
   isEmptyGitRepo :: MonadIO m => FilePath -> m Bool
   isEmptyGitRepo localPath = liftIO $
