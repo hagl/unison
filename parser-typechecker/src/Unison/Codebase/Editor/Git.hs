@@ -126,7 +126,7 @@ pullRepo repo@(ReadGitRepo {url=uri, branch=mayGitBranch}) branchBehavior = do
     (checkOutNew localPath pullBranch)
   case createBranch of
     Nothing -> pure ()
-    Just b -> liftIO ("git" $^ ["checkout", "-B", b, "--track"])
+    Just b -> gitIn localPath ["checkout", "-B", b, "--track"]
   pure localPath
   where
   doesRemoteBranchExist :: Text -> IO Bool
