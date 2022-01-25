@@ -126,7 +126,7 @@ pullRepo repo@(ReadGitRepo {url=uri, branch=mayGitBranch}) branchBehavior = do
     (checkOutNew localPath pullBranch)
   case createBranch of
     Nothing -> pure ()
-    Just b -> liftIO ("git" $^ ["checkout", "--branch", b, "--track"])
+    Just b -> liftIO ("git" $^ ["checkout", "-B", b, "--track"])
   pure localPath
   where
   doesRemoteBranchExist :: Text -> IO Bool
@@ -167,7 +167,7 @@ pullRepo repo@(ReadGitRepo {url=uri, branch=mayGitBranch}) branchBehavior = do
                           gitIn localPath ["checkout", remoteRef]
                           -- If the local checkout fails it means we don't have a local branch for this ref yet,
                           -- create a new branch from main to use.
-                            $? gitIn localPath ["checkout", "--branch", remoteRef, mainBranchRef]
+                            $? gitIn localPath ["checkout", "-b", remoteRef, mainBranchRef]
                           headHash <- gitTextIn localPath ["rev-parse", "HEAD"]
 
                           -- Only do a hard reset if the remote has actually changed.
@@ -229,7 +229,11 @@ setupGitDir localPath =
   ,"--work-tree", Text.pack localPath]
 
 gitIn :: MonadIO m => FilePath -> [Text] -> m ()
-gitIn localPath args = liftIO $ "git" $^ (setupGitDir localPath <> args)
+gitIn localPath args = do
+  traceShowM (localPath, args)
+  liftIO $ "git" $^ (setupGitDir localPath <> args)
 
 gitTextIn :: MonadIO m => FilePath -> [Text] -> m Text
-gitTextIn localPath args = liftIO $ "git" $| setupGitDir localPath <> args
+gitTextIn localPath args = do
+  traceShowM (localPath, args)
+  liftIO $ "git" $| setupGitDir localPath <> args

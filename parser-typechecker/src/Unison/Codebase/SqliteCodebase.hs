@@ -1017,11 +1017,12 @@ viewRemoteBranch' ::
   forall m r.
   (MonadUnliftIO m) =>
   ReadRemoteNamespace ->
+  Git.GitBranchBehavior ->
   ((Branch m, CodebasePath) -> m r) ->
   m (Either C.GitError r)
-viewRemoteBranch' (repo, sbh, path) action = UnliftIO.try do
+viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = UnliftIO.try do
   -- set up the cache dir
-  remotePath <- UnliftIO.fromEitherM . runExceptT . withExceptT C.GitProtocolError . time "Git fetch" $ pullRepo repo Git.RequireExistingBranch
+  remotePath <- UnliftIO.fromEitherM . runExceptT . withExceptT C.GitProtocolError . time "Git fetch" $ pullRepo repo gitBranchBehavior
 
   -- Tickle the database before calling into `sqliteCodebase`; this covers the case that the database file either
   -- doesn't exist at all or isn't a SQLite database file, but does not cover the case that the database file itself is
