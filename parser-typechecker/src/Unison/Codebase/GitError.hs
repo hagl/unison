@@ -20,7 +20,8 @@ data GitProtocolError
     PushDestinationHasNewStuff WriteRepo
   | CleanupError SomeException
   | -- Thrown when a commit, tag, or branch isn't found in a repo.
-    RemoteRefNotFound Text
+    --                repo ref
+    RemoteRefNotFound Text Text
   deriving (Show)
 
 data GitCodebaseError h

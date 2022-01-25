@@ -9,6 +9,7 @@ module Unison.Codebase.Editor.Git
     withIOError,
     withStatus,
     withIsolatedRepo,
+    mainBranchRef,
 
     -- * Exported for testing
     gitCacheDir,
@@ -79,9 +80,10 @@ withIsolatedRepo ::
   forall m r.
   (MonadUnliftIO m) =>
   FilePath ->
+  Text ->
   (FilePath -> m r) ->
   m (Either GitProtocolError r)
-withIsolatedRepo srcPath action = do
+withIsolatedRepo srcPath ref action = do
   UnliftIO.withSystemTempDirectory "ucm-isolated-repo" $ \tempDir -> do
     copyCommand tempDir >>= \case
       Left gitErr -> pure $ Left (GitError.CopyException srcPath tempDir (show gitErr))
@@ -89,7 +91,9 @@ withIsolatedRepo srcPath action = do
   where
     copyCommand :: FilePath -> m (Either IOException ())
     copyCommand dest = UnliftIO.tryIO . liftIO $
-      "git" $^ (["clone", "--quiet"] ++ ["file://" <> Text.pack srcPath, Text.pack dest])
+      "git" $^ (["clone", "--quiet"]
+                ++ ["file://" <> Text.pack srcPath, Text.pack dest]
+                ++ ["--branch", ref])
 
 data GitBranchBehavior =
       CreateBranchIfMissing
@@ -98,22 +102,20 @@ data GitBranchBehavior =
 -- | Given a remote git repo url, and branch/commit hash (currently
 -- not allowed): checks for git, clones or updates a cached copy of the repo
 pullRepo :: forall m. (MonadIO m, MonadError GitProtocolError m) => ReadRepo -> GitBranchBehavior -> m CodebasePath
-pullRepo repo@(ReadGitRepo {url=uri, commitish}) branchBehavior = do
+pullRepo repo@(ReadGitRepo {url=uri, branch=mayGitBranch}) branchBehavior = do
+  let gitBranch = fromMaybe mainBranchRef mayGitBranch
   checkForGit
   localPath <- gitCacheDir uri
 
   (pullBranch, createBranch) <- do
-    case commitish of
-      Nothing -> pure (Nothing, Nothing)
-      Just ref -> do
-        exists <- liftIO $ doesRemoteBranchExist ref
-        case branchBehavior of
-          CreateBranchIfMissing
-            | exists -> pure (Just ref, Nothing)
-            | otherwise -> pure (Nothing, Just ref)
-          RequireExistingBranch
-            | exists -> pure (Just ref, Nothing)
-            | otherwise -> throwError (GitError.RemoteRefNotFound ref)
+    exists <- liftIO $ doesRemoteBranchExist gitBranch
+    case branchBehavior of
+      CreateBranchIfMissing
+        | exists -> pure (Just gitBranch, Nothing)
+        | otherwise -> pure (Nothing, Just gitBranch)
+      RequireExistingBranch
+        | exists -> pure (Just gitBranch, Nothing)
+        | otherwise -> throwError (GitError.RemoteRefNotFound uri gitBranch)
 
   ifM (doesDirectoryExist localPath)
     -- try to update existing directory

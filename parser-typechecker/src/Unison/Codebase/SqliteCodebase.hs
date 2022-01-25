@@ -1075,7 +1075,8 @@ pushGitBranch ::
   WriteRepo ->
   PushGitBranchOpts ->
   m (Either C.GitError ())
-pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = UnliftIO.try $ do
+pushGitBranch srcConn branch repo@(WriteGitRepo{branch'=mayGitBranch}) (PushGitBranchOpts setRoot _syncMode) = UnliftIO.try $ do
+  let gitBranch = fromMaybe Git.mainBranchRef mayGitBranch
   -- Pull the latest remote into our git cache
   -- Use a local git clone to copy this git repo into a temp-dir
   -- Delete the codebase in our temp-dir
@@ -1091,7 +1092,7 @@ pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = Unlift
   --
   -- set up the cache dir
   pathToCachedRemote <- time "Git fetch" $ throwExceptTWith C.GitProtocolError $ pullRepo (writeToRead repo) Git.CreateBranchIfMissing
-  throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote $ \isolatedRemotePath -> do
+  throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote gitBranch $ \isolatedRemotePath -> do
     -- Connect to codebase in the cached git repo so we can copy it over.
     withOpenOrCreateCodebaseConnection @m "push.cached" pathToCachedRemote $ \cachedRemoteConn -> do
       -- Copy our cached remote database cleanly into our isolated directory.
@@ -1180,7 +1181,8 @@ pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = Unlift
 
     -- Commit our changes
     push :: forall m. MonadIO m => CodebasePath -> WriteRepo -> m Bool -- withIOError needs IO
-    push remotePath (WriteGitRepo {url'=url, branch=gitBranch}) = time "SqliteCodebase.pushGitRootBranch.push" $ do
+    push remotePath (WriteGitRepo {url'=url, branch'=mayGitBranch}) = time "SqliteCodebase.pushGitRootBranch.push" $ do
+      let gitBranch = fromMaybe Git.mainBranchRef mayGitBranch
       -- has anything changed?
       -- note: -uall recursively shows status for all files in untracked directories
       --   we want this so that we see
@@ -1208,7 +1210,7 @@ pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = Unlift
               remotePath
               ["commit", "-q", "-m", "Sync branch " <> Text.pack (show $ Branch.headHash branch)]
             -- Push our changes to the repo
-            gitIn remotePath ["push", "--quiet", url]
+            gitIn remotePath ["push", "--quiet", url, "origin", gitBranch]
             pure True
 
 -- | Make a clean copy of the connected codebase into the provided path. Destroys any existing `v2/` directory
