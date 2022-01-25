@@ -1211,7 +1211,7 @@ pushGitBranch srcConn branch repo@(WriteGitRepo{branch'=mayGitBranch}) (PushGitB
               remotePath
               ["commit", "-q", "-m", "Sync branch " <> Text.pack (show $ Branch.headHash branch)]
             -- Push our changes to the repo
-            gitIn remotePath ["push", "--quiet", url, "origin", gitBranch]
+            gitIn remotePath ["push", "--quiet", url, gitBranch]
             pure True
 
 -- | Make a clean copy of the connected codebase into the provided path. Destroys any existing `v2/` directory
