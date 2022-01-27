@@ -92,7 +92,7 @@ import Unison.Type (Type)
 import qualified Unison.Type as Type
 import qualified Unison.Util.Set as Set
 import qualified Unison.WatchKind as UF
-import UnliftIO (catchIO, finally, MonadUnliftIO, throwIO)
+import UnliftIO (catchIO, finally, MonadUnliftIO, throwIO, try)
 import UnliftIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removePathForcibly)
 import UnliftIO.Exception (bracket, catch)
 import UnliftIO.STM
@@ -1019,9 +1019,9 @@ viewRemoteBranch' ::
   Git.GitBranchBehavior ->
   ((Branch m, CodebasePath) -> m r) ->
   m (Either C.GitError r)
-viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = fmap (first C.GitProtocolError) $ do
+viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = UnliftIO.try $ do
   -- set up the cache dir
- time "Git fetch" $ withRepo repo gitBranchBehavior $ \remotePath -> do
+ time "Git fetch" $ throwEitherMWith C.GitProtocolError . withRepo repo gitBranchBehavior $ \remotePath -> do
   -- Tickle the database before calling into `sqliteCodebase`; this covers the case that the database file either
   -- doesn't exist at all or isn't a SQLite database file, but does not cover the case that the database file itself is
   -- somehow corrupt, or not even a Unison database.
@@ -1091,11 +1091,13 @@ pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = fmap (
   -- Delete the temp-dir.
   --
   -- set up the cache dir
+ traceM "Loading repo for branch in push."
  time "Git fetch" . withRepo readRepo Git.CreateBranchIfMissing $ \pathToCachedRemote -> do
+  traceM $ "About to copy repo into isolated path: " <> pathToCachedRemote
   throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote $ \isolatedRemotePath -> do
+    traceM $ "Successfully isolated repo into " <> isolatedRemotePath
     -- Connect to codebase in the cached git repo so we can copy it over.
     withOpenOrCreateCodebaseConnection @m "push.cached" pathToCachedRemote $ \cachedRemoteConn -> do
-      throwExceptTWith C.GitProtocolError $ Git.checkoutAndPullRef isolatedRemotePath readRepo
       -- Copy our cached remote database cleanly into our isolated directory.
       copyCodebase cachedRemoteConn isolatedRemotePath
       -- Connect to the newly copied database which we know has been properly closed and

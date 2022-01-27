@@ -86,8 +86,8 @@ withIsolatedRepo ::
   (FilePath -> m r) ->
   m (Either GitProtocolError r)
 withIsolatedRepo srcPath action = do
-    let tempDir = "/Users/cpenner/Desktop/temp/unison-staging"
-  -- UnliftIO.withSystemTempDirectory "ucm-isolated-repo" $ \tempDir -> do
+    -- let tempDir = "/Users/cpenner/Desktop/temp/unison-staging"
+  UnliftIO.withSystemTempDirectory "ucm-isolated-repo" $ \tempDir -> do
     copyCommand tempDir >>= \case
       Left gitErr -> pure $ Left (GitError.CopyException srcPath tempDir (show gitErr))
       Right () -> Right <$> action tempDir
@@ -130,7 +130,7 @@ withRepo repo@(ReadGitRepo {url = uri, branch = mayGitBranch}) branchBehavior ac
               RequireExistingBranch -> UnliftIO.throwIO (GitError.RemoteRefNotFound uri gitRef)
               CreateBranchIfMissing -> do
                 ignoreFailure $ gitIn workDir ["branch", "-D", gitRef]
-                gitIn workDir ["orphan", gitRef]
+                gitIn workDir ["checkout", "--orphan", gitRef]
                 gitIn workDir ["rm", "--ignore-unmatch", "-rf", "."]
                 action workDir
   where
