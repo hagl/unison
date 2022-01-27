@@ -1075,8 +1075,7 @@ pushGitBranch ::
   WriteRepo ->
   PushGitBranchOpts ->
   m (Either C.GitError ())
-pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = fmap (first C.GitProtocolError) $ do
- let readRepo = writeToRead repo
+pushGitBranch srcConn branch (repo@WriteGitRepo{branch'=mayGitRef}) (PushGitBranchOpts setRoot _syncMode) = fmap (first C.GitProtocolError) $ do
   -- Pull the latest remote into our git cache
   -- Use a local git clone to copy this git repo into a temp-dir
   -- Delete the codebase in our temp-dir
@@ -1092,21 +1091,40 @@ pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = fmap (
   --
   -- set up the cache dir
  traceM "Loading repo for branch in push."
- time "Git fetch" . withRepo readRepo Git.CreateBranchIfMissing $ \pathToCachedRemote -> do
-  traceM $ "About to copy repo into isolated path: " <> pathToCachedRemote
-  throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote $ \isolatedRemotePath -> do
-    traceM $ "Successfully isolated repo into " <> isolatedRemotePath
-    -- Connect to codebase in the cached git repo so we can copy it over.
-    withOpenOrCreateCodebaseConnection @m "push.cached" pathToCachedRemote $ \cachedRemoteConn -> do
-      -- Copy our cached remote database cleanly into our isolated directory.
-      copyCodebase cachedRemoteConn isolatedRemotePath
-      -- Connect to the newly copied database which we know has been properly closed and
-      -- nobody else could be using.
-      withConnection @m "push.dest" isolatedRemotePath $ \destConn -> do
-        flip runReaderT destConn $ Q.withSavepoint_ @(ReaderT _ m) "push" $ do
-          throwExceptT $ doSync isolatedRemotePath srcConn destConn
-    void $ push isolatedRemotePath repo
+ case mayGitRef of
+   -- We currently have a separate workflow for the main branch of remote repos,
+   -- since we want to avoid migrating repos multiple times, i.e. once on every pull, and on
+   -- push.
+   -- Once most folks are migrated we can remove this optimization and simplify the code by
+   -- just using 'pushRef' for everything.
+   Nothing -> pushMain
+   Just _ -> pushRef
   where
+    readRepo = writeToRead repo
+    pushRef = do
+      traceM $ "Using pushRef"
+      withRepo readRepo Git.CreateBranchIfMissing $ \pushStaging -> do
+        traceM $ "pushStaging: " <> pushStaging
+        withOpenOrCreateCodebaseConnection @m "push.dest" pushStaging $ \destConn -> do
+          flip runReaderT destConn $ Q.withSavepoint_ @(ReaderT _ m) "push" $ do
+            throwExceptT $ doSync pushStaging srcConn destConn
+        void $ push pushStaging repo
+    pushMain = do
+      traceM $ "Using pushMain"
+      time "Git fetch" . withRepo readRepo Git.CreateBranchIfMissing $ \pathToCachedRemote -> do
+       traceM $ "About to copy repo into isolated path: " <> pathToCachedRemote
+       throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote $ \isolatedRemotePath -> do
+         traceM $ "Successfully isolated repo into " <> isolatedRemotePath
+         -- Connect to codebase in the cached git repo so we can copy it over.
+         withOpenOrCreateCodebaseConnection @m "push.cached" pathToCachedRemote $ \cachedRemoteConn -> do
+           -- Copy our cached remote database cleanly into our isolated directory.
+           copyCodebase cachedRemoteConn isolatedRemotePath
+           -- Connect to the newly copied database which we know has been properly closed and
+           -- nobody else could be using.
+           withConnection @m "push.dest" isolatedRemotePath $ \destConn -> do
+             flip runReaderT destConn $ Q.withSavepoint_ @(ReaderT _ m) "push" $ do
+               throwExceptT $ doSync isolatedRemotePath srcConn destConn
+         void $ push isolatedRemotePath repo
     doSync :: FilePath -> Connection -> Connection -> ExceptT C.GitError (ReaderT Connection m) ()
     doSync remotePath srcConn destConn = do
       _ <- flip State.execStateT emptySyncProgressState $

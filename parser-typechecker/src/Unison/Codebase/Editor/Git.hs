@@ -138,7 +138,7 @@ withRepo repo@(ReadGitRepo {url = uri, branch = mayGitBranch}) branchBehavior ac
     ignoreFailure cmd = liftIO (cmd $? pure ())
     doesRemoteRefExist :: Text -> m Bool
     doesRemoteRefExist branchName = liftIO $ do
-      output <- "git" $| ["ls-remote", "--heads", uri, branchName]
+      output <- "git" $| ["ls-remote", "--heads", "--tags", "--refs", uri, branchName]
       pure . not . Text.null . Text.strip $ output
 
 -- withWorkDir :: FilePath -> m a
