@@ -460,6 +460,7 @@ test = scope "gitsync22" . tests $
           Codebase.watches cb TestWatch)
   ,
   gistTest fmt,
+  pushPullBranchesTests fmt,
   pushPullTest "fix2068_a_" fmt
     -- this triggers
     {-
@@ -623,6 +624,73 @@ gistTest fmt =
         > y
         ```
       |]
+
+pushPullBranchesTests :: CodebaseFormat -> Test ()
+pushPullBranchesTests fmt = scope "branches" $ do
+  simplePushPull
+  multiplePushPull
+  emptyBranchFailure
+  where
+    simplePushPull =
+      let authorScript repo =
+            [i|
+              ```unison:hide
+              y = 3
+              ```
+              ```ucm
+              .> add
+              .> push.create ${repo}:mybranch:.path
+              ```
+            |]
+          userScript repo =
+            [i|
+              ```ucm
+              .> pull ${repo}:mybranch .dest
+              .> view .dest.path.y
+              ```
+            |]
+       in pushPullTest "simple" fmt authorScript userScript
+    emptyBranchFailure =
+      let authorScript _repo = ""
+          userScript repo =
+            [i|
+              ```ucm:error
+              .> pull ${repo}:mybranch .dest
+              ```
+            |]
+       in pushPullTest "empty" fmt authorScript userScript
+    multiplePushPull =
+      let authorScript repo =
+            [i|
+              ```unison:hide
+              ns1.x = 10
+              ns2.y = 20
+              ```
+              ```ucm
+              .> add
+              .> push.create ${repo}:mybranch:.ns1 .ns1
+              .> push.create ${repo}:mybranch:.ns2 .ns2
+              ```
+              ```unison
+              ns1.x = 11
+              ns1.new = 12
+              ```
+              ```ucm
+              .> update
+              .> push ${repo}:mybranch:.ns1 .ns1
+              ```
+            |]
+          userScript repo =
+            [i|
+              ```ucm
+              .> pull ${repo}:mybranch:.ns1 .ns1
+              .> pull ${repo}:mybranch:.ns2 .ns2
+              .> view .ns1.x
+              .> view .ns1.new
+              .> view .ns2.y
+              ```
+            |]
+       in pushPullTest "multiple" fmt authorScript userScript
 
 fastForwardPush :: Test ()
 fastForwardPush = scope "fastforward-push" do
