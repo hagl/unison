@@ -5,11 +5,12 @@
 module Unison.Codebase.Editor.Git
   ( gitIn,
     gitTextIn,
-    pullRepo,
+    withRepo,
     withIOError,
     withStatus,
     withIsolatedRepo,
     mainBranchRef,
+    checkoutAndPullRef,
 
     -- * Exported for testing
     gitCacheDir,
@@ -76,15 +77,17 @@ withStatus str ma = do
 
 -- | Run an action on an isolated copy of the provided repo. The repo is deleted when the
 -- action exits or fails.
+-- Note that you should probably explicitly check out whatever ref you want in the isolated
+-- repo, since the repo it copied could be in some unknown state.
 withIsolatedRepo ::
   forall m r.
   (MonadUnliftIO m) =>
   FilePath ->
-  Text ->
   (FilePath -> m r) ->
   m (Either GitProtocolError r)
-withIsolatedRepo srcPath ref action = do
-  UnliftIO.withSystemTempDirectory "ucm-isolated-repo" $ \tempDir -> do
+withIsolatedRepo srcPath action = do
+    let tempDir = "/Users/cpenner/Desktop/temp/unison-staging"
+  -- UnliftIO.withSystemTempDirectory "ucm-isolated-repo" $ \tempDir -> do
     copyCommand tempDir >>= \case
       Left gitErr -> pure $ Left (GitError.CopyException srcPath tempDir (show gitErr))
       Right () -> Right <$> action tempDir
@@ -93,117 +96,166 @@ withIsolatedRepo srcPath ref action = do
     copyCommand dest = UnliftIO.tryIO . liftIO $
       "git" $^ (["clone", "--quiet"]
                 ++ ["file://" <> Text.pack srcPath, Text.pack dest]
-                ++ ["--branch", ref])
+               )
 
 data GitBranchBehavior =
       CreateBranchIfMissing
     | RequireExistingBranch
 
--- | Given a remote git repo url, and branch/commit hash (currently
--- not allowed): checks for git, clones or updates a cached copy of the repo
-pullRepo :: forall m. (MonadIO m, MonadError GitProtocolError m) => ReadRepo -> GitBranchBehavior -> m CodebasePath
-pullRepo repo@(ReadGitRepo {url=uri, branch=mayGitBranch}) branchBehavior = do
-  let gitBranch = fromMaybe mainBranchRef mayGitBranch
-  checkForGit
-  localPath <- gitCacheDir uri
-
-  (pullBranch, createBranch) <- do
-    exists <- liftIO $ doesRemoteBranchExist gitBranch
-    case branchBehavior of
-      CreateBranchIfMissing
-        | exists -> pure (Just gitBranch, Nothing)
-        | otherwise -> pure (Nothing, Just gitBranch)
-      RequireExistingBranch
-        | exists -> pure (Just gitBranch, Nothing)
-        | otherwise -> throwError (GitError.RemoteRefNotFound uri gitBranch)
-
-  ifM (doesDirectoryExist localPath)
-    -- try to update existing directory
-    (ifM (isGitRepo localPath)
-      (checkoutExisting localPath pullBranch)
-      (throwError (GitError.UnrecognizableCacheDir repo localPath)))
-    -- directory doesn't exist, so clone anew
-    (checkOutNew localPath pullBranch)
-  case createBranch of
-    Nothing -> pure ()
-    Just b -> gitIn localPath ["checkout", "-B", b]
-  pure localPath
+withRepo ::
+  forall m a.
+  (MonadUnliftIO m) =>
+  ReadRepo ->
+  GitBranchBehavior ->
+  (CodebasePath -> m a) ->
+  m (Either GitProtocolError a)
+withRepo repo@(ReadGitRepo {url = uri, branch = mayGitBranch}) branchBehavior action = UnliftIO.try $ do
+  throwExceptT $ checkForGit
+  gitCachePath <- gitCacheDir uri
+  -- Ensure we have the main branch in the cache dir no matter what
+  throwExceptT $ cloneIfMissing repo {branch = Nothing} gitCachePath
+  case mayGitBranch of
+    Nothing -> do
+      throwExceptT $ checkoutAndPullRef gitCachePath repo
+      action gitCachePath
+    Just gitRef ->
+      throwEitherM . withIsolatedRepo gitCachePath $ \workDir -> do
+        doesRemoteRefExist gitRef >>= \case
+          True -> do
+            fetchHead <- shallowFetch workDir uri gitRef
+            gitIn workDir ["checkout", "-B", gitRef, fetchHead]
+            action workDir
+          False ->
+            case branchBehavior of
+              RequireExistingBranch -> UnliftIO.throwIO (GitError.RemoteRefNotFound uri gitRef)
+              CreateBranchIfMissing -> do
+                ignoreFailure $ gitIn workDir ["branch", "-D", gitRef]
+                gitIn workDir ["orphan", gitRef]
+                gitIn workDir ["rm", "--ignore-unmatch", "-rf", "."]
+                action workDir
   where
-  doesRemoteBranchExist :: Text -> IO Bool
-  doesRemoteBranchExist branchName = do
-    output <- "git" $| ["ls-remote", "--heads", uri, branchName]
-    pure . not . Text.null . Text.strip $ output
+    ignoreFailure :: forall m. MonadIO m => IO () -> m ()
+    ignoreFailure cmd = liftIO (cmd $? pure ())
+    doesRemoteRefExist :: Text -> m Bool
+    doesRemoteRefExist branchName = liftIO $ do
+      output <- "git" $| ["ls-remote", "--heads", uri, branchName]
+      pure . not . Text.null . Text.strip $ output
 
-  -- | Do a `git clone` (for a not-previously-cached repo).
-  checkOutNew :: CodebasePath -> Maybe Text -> m ()
-  checkOutNew localPath commitish = do
-    withStatus ("Downloading from " ++ Text.unpack uri ++ " ...") $
-      (liftIO $
-        "git" $^ (["clone", "--quiet"] ++ ["--depth", "1"]
-         ++ maybe [] (\t -> ["--branch", t]) commitish
-         ++ [uri, Text.pack localPath]))
-        `withIOError` (throwError . GitError.CloneException repo . show)
-    isGitDir <- liftIO $ isGitRepo localPath
-    unless isGitDir . throwError $ GitError.UnrecognizableCheckoutDir repo localPath
+-- withWorkDir :: FilePath -> m a
+-- withWorkDir workDir = do
+--   (pullBranch, createBranch) <- do
+--     exists <- doesRemoteBranchExist gitBranch
+--     case branchBehavior of
+--       CreateBranchIfMissing
+--         | exists -> pure (Just gitBranch, Nothing)
+--         | otherwise -> pure (Nothing, Just gitBranch)
+--       RequireExistingBranch
+--         | exists -> pure (Just gitBranch, Nothing)
+--         | otherwise -> throwError (GitError.RemoteRefNotFound uri gitBranch)
 
-  -- | Do a `git pull` on a cached repo.
-  checkoutExisting :: (MonadIO m, MonadError GitProtocolError m)
-                   => FilePath
-                   -> Maybe Text
-                   -> m ()
-  checkoutExisting localPath maybeRemoteRef =
-    ifM (isEmptyGitRepo localPath)
-      -- I don't know how to properly update from an empty remote repo.
-      -- As a heuristic, if this cached copy is empty, then the remote might
-      -- be too, so this impl. just wipes the cached copy and starts from scratch.
-      (goFromScratch maybeRemoteRef)
-      -- Otherwise proceed!
-      do
-        succeeded <- liftIO . handleIO (const $ pure False) $ do
-                         withStatus ("Updating cached copy of " ++ Text.unpack uri ++ " ...") $ do
-                          -- Fetch only the latest commit, we don't need history.
-                          gitIn localPath (["fetch", "origin", remoteRef, "--quiet"] ++ ["--depth", "1"])
-                          fetchHeadHash <- gitTextIn localPath ["rev-parse", "FETCH_HEAD"]
-                          gitIn localPath ["checkout", remoteRef]
-                          -- If the local checkout fails it means we don't have a local branch for this ref yet,
-                          -- create a new branch from main to use.
-                            $? gitIn localPath ["checkout", "-b", remoteRef, mainBranchRef]
-                          headHash <- gitTextIn localPath ["rev-parse", "HEAD"]
+    --   case createBranch of
+    --     Nothing -> checkoutAndPullRef localPath repo{branch=pullBranch}
+    --     Just b -> do
+    --       -- We've already established this branch does not exist on the remote,
+    --       -- delete any stale local branch we may have.
+    --       -- It's possible we've got the branch we're working with currently checked out,
+    --       -- so we need to check out some other branch before deleting it.
+    --       ignoreFailure (gitIn localPath ["checkout", "-B", "_unison_temp_branch"])
+    --       ignoreFailure (gitIn localPath ["branch", "-D", b])
+    --       -- Create an empty local branch.
+    --       gitIn localPath ["checkout", "--orphan", b]
+    --       ignoreFailure (gitIn localPath ["rm", "--ignore-unmatch", "-rf", "."])
+    --   pure localPath
 
-                          -- Only do a hard reset if the remote has actually changed.
-                          -- This allows us to persist any codebase migrations in the dirty work tree,
-                          -- and avoid re-migrating a codebase we've migrated before.
-                          when (fetchHeadHash /= headHash) do
-                            -- Reset our branch to point at the latest code from the remote.
-                            gitIn localPath ["reset", "--hard", "--quiet", "FETCH_HEAD"]
-                            -- Wipe out any unwanted files which might be sitting around, but aren't in the commit.
-                            -- Note that this wipes out any in-progress work which other ucm processes may
-                            -- have in progress, which we may want to handle more nicely in the future.
-                            gitIn localPath ["clean", "-d", "--force", "--quiet"]
-                          pure True
-        when (not succeeded) $ goFromScratch maybeRemoteRef
+shallowFetch :: MonadIO m => FilePath -> Text -> Text -> m Text
+shallowFetch localPath uri remoteRef = do
+  gitIn localPath (["fetch", uri, remoteRef, "--quiet"] ++ ["--depth", "1"])
+  fetchHeadHash <- gitTextIn localPath ["rev-parse", "FETCH_HEAD"]
+  pure fetchHeadHash
 
-    where
-      remoteRef :: Text
-      remoteRef = fromMaybe mainBranchRef maybeRemoteRef
-      goFromScratch :: (MonadIO m, MonadError GitProtocolError m) => Maybe Text -> m  ()
-      goFromScratch ref = do
-        wipeDir localPath
-        checkOutNew localPath ref
+checkoutAndPullRef ::
+  forall m.
+  (MonadIO m, MonadError GitProtocolError m) =>
+  FilePath ->
+  ReadRepo ->
+  m ()
+checkoutAndPullRef localPath repo@(ReadGitRepo{url=uri, branch=mayRemoteRef}) =
+  ifM (isEmptyGitRepo localPath)
+    -- I don't know how to properly update from an empty remote repo.
+    -- As a heuristic, if this cached copy is empty, then the remote might
+    -- be too, so this impl. just wipes the cached copy and starts from scratch.
+    goFromScratch
+    -- Otherwise proceed!
+    do
+      succeeded <- liftIO . handleIO (const $ pure False) $ do
+                       withStatus ("Updating cached copy of " ++ Text.unpack uri ++ " ...") $ do
+                        -- Fetch only the latest commit, we don't need history.
+                        gitIn localPath (["fetch", uri, remoteRef, "--quiet"] ++ ["--depth", "1"])
+                        fetchHeadHash <- gitTextIn localPath ["rev-parse", "FETCH_HEAD"]
+                        gitIn localPath ["checkout", remoteRef]
+                        -- If the local checkout fails it means we don't have a local branch for this ref yet,
+                        -- create a new branch from main to use.
+                          $? gitIn localPath ["checkout", "-b", remoteRef, mainBranchRef]
+                        headHash <- gitTextIn localPath ["rev-parse", remoteRef]
 
-  isEmptyGitRepo :: MonadIO m => FilePath -> m Bool
-  isEmptyGitRepo localPath = liftIO $
-    -- if rev-parse succeeds, the repo is _not_ empty, so return False; else True
-    (gitTextIn localPath ["rev-parse", "--verify", "--quiet", "HEAD"] $> False)
-      $? pure True
+                        -- Only do a hard reset if the remote has actually changed.
+                        -- This allows us to persist any codebase migrations in the dirty work tree,
+                        -- and avoid re-migrating a codebase we've migrated before.
+                        when (fetchHeadHash /= headHash) do
+                          -- Reset our branch to point at the latest code from the remote.
+                          gitIn localPath ["reset", "--hard", "--quiet", fetchHeadHash]
+                          -- Wipe out any unwanted files which might be sitting around, but aren't in the commit.
+                          -- Note that this wipes out any in-progress work which other ucm processes may
+                          -- have in progress, which we may want to handle more nicely in the future.
+                          gitIn localPath ["clean", "-d", "--force", "--quiet"]
+                        pure True
+      when (not succeeded) $ goFromScratch
+  where
+    remoteRef :: Text
+    remoteRef = fromMaybe mainBranchRef mayRemoteRef
 
-  -- | try removing a cached copy
-  wipeDir localPath = do
-    e <- Ex.tryAny . whenM (doesDirectoryExist localPath) $
-      removeDirectoryRecursive localPath
-    case e of
-      Left e -> throwError (GitError.CleanupError e)
-      Right _ -> pure ()
+    goFromScratch :: (MonadIO m, MonadError GitProtocolError m) => m  ()
+    goFromScratch = do
+      traceM "Something went wrong, going from scratch!"
+      wipeDir localPath
+      cloneIfMissing repo localPath
+
+    isEmptyGitRepo :: MonadIO m => FilePath -> m Bool
+    isEmptyGitRepo localPath = liftIO $
+      -- if rev-parse succeeds, the repo is _not_ empty, so return False; else True
+      (gitTextIn localPath ["rev-parse", "--verify", "--quiet", "HEAD"] $> False)
+        $? pure True
+
+    -- | try removing a cached copy
+    wipeDir :: FilePath -> m ()
+    wipeDir localPath = do
+      e <- Ex.tryAny . whenM (doesDirectoryExist localPath) $
+        removeDirectoryRecursive localPath
+      case e of
+        Left e -> throwError (GitError.CleanupError e)
+        Right _ -> pure ()
+
+
+-- | Do a `git clone` (for a not-previously-cached repo).
+cloneIfMissing :: (MonadIO m, MonadError GitProtocolError m) => ReadRepo -> CodebasePath -> m ()
+cloneIfMissing repo@(ReadGitRepo {url=uri, branch=gitBranch}) localPath = do
+  doesDirectoryExist localPath >>= \case
+    True ->
+      whenM (not <$> isGitRepo localPath) $ do
+        throwError (GitError.UnrecognizableCacheDir repo localPath)
+    False -> do
+      -- directory doesn't exist, so clone anew
+      cloneRepo
+  where
+    cloneRepo = do
+      withStatus ("Downloading from " ++ Text.unpack uri ++ " ...") $
+        (liftIO $
+          "git" $^ (["clone", "--quiet"] ++ ["--depth", "1"]
+           ++ maybe [] (\t -> ["--branch", t]) gitBranch
+           ++ [uri, Text.pack localPath]))
+          `withIOError` (throwError . GitError.CloneException repo . show)
+      isGitDir <- liftIO $ isGitRepo localPath
+      unless isGitDir . throwError $ GitError.UnrecognizableCheckoutDir repo localPath
 
 -- | See if `git` is on the system path.
 checkForGit :: MonadIO m => MonadError GitProtocolError m => m ()

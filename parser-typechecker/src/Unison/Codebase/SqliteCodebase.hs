@@ -13,13 +13,13 @@ module Unison.Codebase.SqliteCodebase
 where
 
 import qualified Control.Concurrent
-import Control.Monad.Except (runExceptT, withExceptT, throwError, ExceptT)
+import Control.Monad.Except (runExceptT, throwError, ExceptT)
 import qualified Control.Monad.Except as Except
 import qualified Control.Monad.Extra as Monad
 import Control.Monad.Reader (ReaderT (runReaderT))
 import Control.Monad.State (MonadState)
 import qualified Control.Monad.State as State
-import Data.Bifunctor (Bifunctor (bimap), second)
+import Data.Bifunctor (Bifunctor (bimap), second, first)
 import qualified Data.Char as Char
 import qualified Data.Either.Combinators as Either
 import qualified Data.List as List
@@ -54,7 +54,7 @@ import qualified Unison.Codebase as Codebase1
 import Unison.Codebase.Branch (Branch (..))
 import qualified Unison.Codebase.Branch as Branch
 import qualified Unison.Codebase.Causal as Causal
-import Unison.Codebase.Editor.Git (gitIn, gitTextIn, pullRepo, withIsolatedRepo)
+import Unison.Codebase.Editor.Git (gitIn, gitTextIn, withRepo, withIsolatedRepo)
 import qualified Unison.Codebase.Editor.Git as Git
 import Unison.Codebase.Editor.RemoteRepo (ReadRemoteNamespace, WriteRepo (..), printWriteRepo, writeToRead)
 import qualified Unison.Codebase.GitError as GitError
@@ -93,7 +93,6 @@ import qualified Unison.Type as Type
 import qualified Unison.Util.Set as Set
 import qualified Unison.WatchKind as UF
 import UnliftIO (catchIO, finally, MonadUnliftIO, throwIO)
-import qualified UnliftIO
 import UnliftIO.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removePathForcibly)
 import UnliftIO.Exception (bracket, catch)
 import UnliftIO.STM
@@ -1020,10 +1019,9 @@ viewRemoteBranch' ::
   Git.GitBranchBehavior ->
   ((Branch m, CodebasePath) -> m r) ->
   m (Either C.GitError r)
-viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = UnliftIO.try do
+viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = fmap (first C.GitProtocolError) $ do
   -- set up the cache dir
-  remotePath <- UnliftIO.fromEitherM . runExceptT . withExceptT C.GitProtocolError . time "Git fetch" $ pullRepo repo gitBranchBehavior
-
+ time "Git fetch" $ withRepo repo gitBranchBehavior $ \remotePath -> do
   -- Tickle the database before calling into `sqliteCodebase`; this covers the case that the database file either
   -- doesn't exist at all or isn't a SQLite database file, but does not cover the case that the database file itself is
   -- somehow corrupt, or not even a Unison database.
@@ -1059,9 +1057,10 @@ viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = UnliftIO.try do
               Just b -> pure b
               Nothing -> throwIO . C.GitCodebaseError $ GitError.NoRemoteNamespaceWithHash repo sbh
           _ -> throwIO . C.GitCodebaseError $ GitError.RemoteNamespaceHashAmbiguous repo sbh branchCompletions
-    case Branch.getAt path branch of
-      Just b -> action (b, remotePath)
-      Nothing -> throwIO . C.GitCodebaseError $ GitError.CouldntFindRemoteBranch repo path
+    case Branch.getAt' path branch of
+      -- TODO: investigate how this should work
+      b -> action (b, remotePath)
+      -- Nothing -> throwIO . C.GitCodebaseError $ GitError.CouldntFindRemoteBranch repo path
   case result of
     Left schemaVersion -> throwIO . C.GitSqliteCodebaseError $ GitError.UnrecognizedSchemaVersion repo remotePath schemaVersion
     Right inner -> pure inner
@@ -1076,8 +1075,8 @@ pushGitBranch ::
   WriteRepo ->
   PushGitBranchOpts ->
   m (Either C.GitError ())
-pushGitBranch srcConn branch repo@(WriteGitRepo{branch'=mayGitBranch}) (PushGitBranchOpts setRoot _syncMode) = UnliftIO.try $ do
-  let gitBranch = fromMaybe Git.mainBranchRef mayGitBranch
+pushGitBranch srcConn branch repo (PushGitBranchOpts setRoot _syncMode) = fmap (first C.GitProtocolError) $ do
+ let readRepo = writeToRead repo
   -- Pull the latest remote into our git cache
   -- Use a local git clone to copy this git repo into a temp-dir
   -- Delete the codebase in our temp-dir
@@ -1092,10 +1091,11 @@ pushGitBranch srcConn branch repo@(WriteGitRepo{branch'=mayGitBranch}) (PushGitB
   -- Delete the temp-dir.
   --
   -- set up the cache dir
-  pathToCachedRemote <- time "Git fetch" $ throwExceptTWith C.GitProtocolError $ pullRepo (writeToRead repo) Git.CreateBranchIfMissing
-  throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote gitBranch $ \isolatedRemotePath -> do
+ time "Git fetch" . withRepo readRepo Git.CreateBranchIfMissing $ \pathToCachedRemote -> do
+  throwEitherMWith C.GitProtocolError . withIsolatedRepo pathToCachedRemote $ \isolatedRemotePath -> do
     -- Connect to codebase in the cached git repo so we can copy it over.
     withOpenOrCreateCodebaseConnection @m "push.cached" pathToCachedRemote $ \cachedRemoteConn -> do
+      throwExceptTWith C.GitProtocolError $ Git.checkoutAndPullRef isolatedRemotePath readRepo
       -- Copy our cached remote database cleanly into our isolated directory.
       copyCodebase cachedRemoteConn isolatedRemotePath
       -- Connect to the newly copied database which we know has been properly closed and

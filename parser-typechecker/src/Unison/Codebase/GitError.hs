@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveAnyClass #-}
+
 module Unison.Codebase.GitError where
 
 import Unison.Codebase.Editor.RemoteRepo (ReadRemoteNamespace, ReadRepo, WriteRepo)
@@ -22,7 +24,8 @@ data GitProtocolError
   | -- Thrown when a commit, tag, or branch isn't found in a repo.
     --                repo ref
     RemoteRefNotFound Text Text
-  deriving (Show)
+  deriving stock (Show)
+  deriving anyclass (Exception)
 
 data GitCodebaseError h
   = NoRemoteNamespaceWithHash ReadRepo ShortBranchHash
