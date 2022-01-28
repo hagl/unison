@@ -10,7 +10,7 @@ module Unison.Codebase.Editor.Git
     withStatus,
     withIsolatedRepo,
     mainBranchRef,
-    checkoutAndPullRef,
+    checkoutAndPullMain,
 
     -- * Exported for testing
     gitCacheDir,
@@ -37,6 +37,7 @@ import qualified Data.Char as Char
 import Unison.Codebase.GitError (GitProtocolError)
 import UnliftIO (handleIO, MonadUnliftIO)
 import qualified UnliftIO
+import qualified UnliftIO.Process as UnliftIO
 
 -- Name of the main branch used in codebase repositories
 mainBranchRef :: Text
@@ -86,7 +87,6 @@ withIsolatedRepo ::
   (FilePath -> m r) ->
   m (Either GitProtocolError r)
 withIsolatedRepo srcPath action = do
-    -- let tempDir = "/Users/cpenner/Desktop/temp/unison-staging"
   UnliftIO.withSystemTempDirectory "ucm-isolated-repo" $ \tempDir -> do
     copyCommand tempDir >>= \case
       Left gitErr -> pure $ Left (GitError.CopyException srcPath tempDir (show gitErr))
@@ -116,56 +116,29 @@ withRepo repo@(ReadGitRepo {url = uri, branch = mayGitBranch}) branchBehavior ac
   throwExceptT $ cloneIfMissing repo {branch = Nothing} gitCachePath
   case mayGitBranch of
     Nothing -> do
-      throwExceptT $ checkoutAndPullRef gitCachePath repo
+      throwExceptT $ checkoutAndPullMain gitCachePath uri
       action gitCachePath
     Just gitRef ->
       throwEitherM . withIsolatedRepo gitCachePath $ \workDir -> do
         doesRemoteRefExist gitRef >>= \case
           True -> do
             fetchHead <- shallowFetch workDir uri gitRef
+            -- Check out the local branch at the same hash as the latest remote.
             gitIn workDir ["checkout", "-B", gitRef, fetchHead]
             action workDir
           False ->
             case branchBehavior of
               RequireExistingBranch -> UnliftIO.throwIO (GitError.RemoteRefNotFound uri gitRef)
               CreateBranchIfMissing -> do
-                ignoreFailure $ gitIn workDir ["branch", "-D", gitRef]
-                gitIn workDir ["checkout", "--orphan", gitRef]
-                gitIn workDir ["rm", "--ignore-unmatch", "-rf", "."]
+                gitInIgnoreFailure workDir ["branch", "--quiet", "-D", gitRef]
+                gitIn workDir ["checkout", "--quiet", "--orphan", gitRef]
+                gitInIgnoreFailure workDir ["rm", "--quiet", "--ignore-unmatch", "-rf", "."]
                 action workDir
   where
-    ignoreFailure :: forall m. MonadIO m => IO () -> m ()
-    ignoreFailure cmd = liftIO (cmd $? pure ())
     doesRemoteRefExist :: Text -> m Bool
     doesRemoteRefExist branchName = liftIO $ do
       output <- "git" $| ["ls-remote", "--heads", "--tags", "--refs", uri, branchName]
       pure . not . Text.null . Text.strip $ output
-
--- withWorkDir :: FilePath -> m a
--- withWorkDir workDir = do
---   (pullBranch, createBranch) <- do
---     exists <- doesRemoteBranchExist gitBranch
---     case branchBehavior of
---       CreateBranchIfMissing
---         | exists -> pure (Just gitBranch, Nothing)
---         | otherwise -> pure (Nothing, Just gitBranch)
---       RequireExistingBranch
---         | exists -> pure (Just gitBranch, Nothing)
---         | otherwise -> throwError (GitError.RemoteRefNotFound uri gitBranch)
-
-    --   case createBranch of
-    --     Nothing -> checkoutAndPullRef localPath repo{branch=pullBranch}
-    --     Just b -> do
-    --       -- We've already established this branch does not exist on the remote,
-    --       -- delete any stale local branch we may have.
-    --       -- It's possible we've got the branch we're working with currently checked out,
-    --       -- so we need to check out some other branch before deleting it.
-    --       ignoreFailure (gitIn localPath ["checkout", "-B", "_unison_temp_branch"])
-    --       ignoreFailure (gitIn localPath ["branch", "-D", b])
-    --       -- Create an empty local branch.
-    --       gitIn localPath ["checkout", "--orphan", b]
-    --       ignoreFailure (gitIn localPath ["rm", "--ignore-unmatch", "-rf", "."])
-    --   pure localPath
 
 shallowFetch :: MonadIO m => FilePath -> Text -> Text -> m Text
 shallowFetch localPath uri remoteRef = do
@@ -173,13 +146,13 @@ shallowFetch localPath uri remoteRef = do
   fetchHeadHash <- gitTextIn localPath ["rev-parse", "FETCH_HEAD"]
   pure fetchHeadHash
 
-checkoutAndPullRef ::
+checkoutAndPullMain ::
   forall m.
   (MonadIO m, MonadError GitProtocolError m) =>
   FilePath ->
-  ReadRepo ->
+  Text ->
   m ()
-checkoutAndPullRef localPath repo@(ReadGitRepo{url=uri, branch=mayRemoteRef}) =
+checkoutAndPullMain localPath repoURI =
   ifM (isEmptyGitRepo localPath)
     -- I don't know how to properly update from an empty remote repo.
     -- As a heuristic, if this cached copy is empty, then the remote might
@@ -188,15 +161,11 @@ checkoutAndPullRef localPath repo@(ReadGitRepo{url=uri, branch=mayRemoteRef}) =
     -- Otherwise proceed!
     do
       succeeded <- liftIO . handleIO (const $ pure False) $ do
-                       withStatus ("Updating cached copy of " ++ Text.unpack uri ++ " ...") $ do
+                       withStatus ("Updating cached copy of " ++ Text.unpack repoURI ++ " ...") $ do
                         -- Fetch only the latest commit, we don't need history.
-                        gitIn localPath (["fetch", uri, remoteRef, "--quiet"] ++ ["--depth", "1"])
+                        gitIn localPath (["fetch", repoURI, "--quiet"] ++ ["--depth", "1"])
                         fetchHeadHash <- gitTextIn localPath ["rev-parse", "FETCH_HEAD"]
-                        gitIn localPath ["checkout", remoteRef]
-                        -- If the local checkout fails it means we don't have a local branch for this ref yet,
-                        -- create a new branch from main to use.
-                          $? gitIn localPath ["checkout", "-b", remoteRef, mainBranchRef]
-                        headHash <- gitTextIn localPath ["rev-parse", remoteRef]
+                        headHash <- gitTextIn localPath ["rev-parse"]
 
                         -- Only do a hard reset if the remote has actually changed.
                         -- This allows us to persist any codebase migrations in the dirty work tree,
@@ -211,14 +180,11 @@ checkoutAndPullRef localPath repo@(ReadGitRepo{url=uri, branch=mayRemoteRef}) =
                         pure True
       when (not succeeded) $ goFromScratch
   where
-    remoteRef :: Text
-    remoteRef = fromMaybe mainBranchRef mayRemoteRef
-
     goFromScratch :: (MonadIO m, MonadError GitProtocolError m) => m  ()
     goFromScratch = do
       traceM "Something went wrong, going from scratch!"
       wipeDir localPath
-      cloneIfMissing repo localPath
+      cloneIfMissing (ReadGitRepo{url=repoURI, branch=Nothing}) localPath
 
     isEmptyGitRepo :: MonadIO m => FilePath -> m Bool
     isEmptyGitRepo localPath = liftIO $
@@ -284,6 +250,19 @@ gitIn :: MonadIO m => FilePath -> [Text] -> m ()
 gitIn localPath args = do
   traceShowM (localPath, args)
   liftIO $ "git" $^ (setupGitDir localPath <> args)
+
+-- | like 'gitIn', but ignores failed commands, and hides stdout and stderr.
+gitInIgnoreFailure :: MonadIO m => FilePath -> [Text] -> m ()
+gitInIgnoreFailure localPath args = do
+  traceShowM (localPath, args)
+  void $ UnliftIO.readProcessWithExitCode "git" (Text.unpack <$> setupGitDir localPath <> args) ""
+
+-- -- | like 'gitIn', but ignores failed commands, and hides stdout and stderr.
+-- gitInSilenced :: MonadIO m => FilePath -> [Text] -> m ()
+-- gitInSilenced localPath args = do
+--   traceShowM (localPath, args)
+--   void $ UnliftIO.readProcessWithExitCode "git" (Text.unpack <$> setupGitDir localPath <> args) ""
+
 
 gitTextIn :: MonadIO m => FilePath -> [Text] -> m Text
 gitTextIn localPath args = do

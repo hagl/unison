@@ -19,7 +19,7 @@ import qualified Control.Monad.Extra as Monad
 import Control.Monad.Reader (ReaderT (runReaderT))
 import Control.Monad.State (MonadState)
 import qualified Control.Monad.State as State
-import Data.Bifunctor (Bifunctor (bimap), second, first)
+import Data.Bifunctor (Bifunctor (bimap), second)
 import qualified Data.Char as Char
 import qualified Data.Either.Combinators as Either
 import qualified Data.List as List
@@ -1057,10 +1057,9 @@ viewRemoteBranch' (repo, sbh, path) gitBranchBehavior action = UnliftIO.try $ do
               Just b -> pure b
               Nothing -> throwIO . C.GitCodebaseError $ GitError.NoRemoteNamespaceWithHash repo sbh
           _ -> throwIO . C.GitCodebaseError $ GitError.RemoteNamespaceHashAmbiguous repo sbh branchCompletions
-    case Branch.getAt' path branch of
-      -- TODO: investigate how this should work
-      b -> action (b, remotePath)
-      -- Nothing -> throwIO . C.GitCodebaseError $ GitError.CouldntFindRemoteBranch repo path
+    case Branch.getAt path branch of
+      Just b -> action (b, remotePath)
+      Nothing -> throwIO . C.GitCodebaseError $ GitError.CouldntFindRemoteBranch repo path
   case result of
     Left schemaVersion -> throwIO . C.GitSqliteCodebaseError $ GitError.UnrecognizedSchemaVersion repo remotePath schemaVersion
     Right inner -> pure inner
@@ -1075,7 +1074,7 @@ pushGitBranch ::
   WriteRepo ->
   PushGitBranchOpts ->
   m (Either C.GitError ())
-pushGitBranch srcConn branch (repo@WriteGitRepo{branch'=mayGitRef}) (PushGitBranchOpts setRoot _syncMode) = fmap (first C.GitProtocolError) $ do
+pushGitBranch srcConn branch (repo@WriteGitRepo{branch'=mayGitRef}) (PushGitBranchOpts setRoot _syncMode) = mapLeft C.GitProtocolError <$> do
   -- Pull the latest remote into our git cache
   -- Use a local git clone to copy this git repo into a temp-dir
   -- Delete the codebase in our temp-dir
