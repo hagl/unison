@@ -120,25 +120,36 @@ withRepo repo@(ReadGitRepo {url = uri, branch = mayGitBranch}) branchBehavior ac
       action gitCachePath
     Just gitRef ->
       throwEitherM . withIsolatedRepo gitCachePath $ \workDir -> do
-        doesRemoteRefExist gitRef >>= \case
+        doesRemoteRefExist workDir gitRef >>= \case
           True -> do
             fetchHead <- shallowFetch workDir uri gitRef
             -- Check out the local branch at the same hash as the latest remote.
-            gitIn workDir ["checkout", "-B", gitRef, fetchHead]
+            gitIn workDir ["checkout", "--quiet", "-B", gitRef, fetchHead]
             action workDir
           False ->
             case branchBehavior of
               RequireExistingBranch -> UnliftIO.throwIO (GitError.RemoteRefNotFound uri gitRef)
               CreateBranchIfMissing -> do
-                gitInIgnoreFailure workDir ["branch", "--quiet", "-D", gitRef]
+                localRefExists <- doesLocalRefExist workDir gitRef
+                when localRefExists $ do
+                  currentBranch <- gitTextIn workDir ["branch", "--show-current"]
+                  -- In the rare case where we've got the branch already checked out,
+                  -- we need to temporarily switch to a different branch so we can delete and
+                  -- reset the branch to an orphan.
+                  when (currentBranch == gitRef) $ gitIn workDir ["branch", "--quiet", "-B", "_unison_temp_branch"]
+                  gitIn workDir ["branch", "--quiet", "-D", gitRef]
                 gitIn workDir ["checkout", "--quiet", "--orphan", gitRef]
                 gitInIgnoreFailure workDir ["rm", "--quiet", "--ignore-unmatch", "-rf", "."]
                 action workDir
   where
-    doesRemoteRefExist :: Text -> m Bool
-    doesRemoteRefExist branchName = liftIO $ do
-      output <- "git" $| ["ls-remote", "--heads", "--tags", "--refs", uri, branchName]
+    doesRemoteRefExist :: FilePath -> Text -> m Bool
+    doesRemoteRefExist workDir branchName = liftIO $ do
+      output <- gitTextIn workDir ["ls-remote", "--heads", "--tags", "--refs", uri, branchName]
       pure . not . Text.null . Text.strip $ output
+    doesLocalRefExist :: FilePath -> Text -> m Bool
+    doesLocalRefExist workDir ref = liftIO $ do
+      (gitIn workDir ["show-ref", "--quiet", "--verify", "refs/heads/" <> ref] $> True)
+        $? pure False
 
 shallowFetch :: MonadIO m => FilePath -> Text -> Text -> m Text
 shallowFetch localPath uri remoteRef = do
